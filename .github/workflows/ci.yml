@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (Go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.26"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go ${{ matrix.go }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+      - name: go fmt check
+        run: |
+          gofmt -l . | tee /tmp/fmt.out
+          test ! -s /tmp/fmt.out
+      - name: go vet
+        run: go vet ./...
+      - name: go build
+        run: go build ./...
+      - name: go test
+        run: go test -count=1 ./...
+      - name: go test -race
+        run: CGO_ENABLED=1 go test -race -count=1 ./...
+      - name: go test -cover
+        run: go test -cover -count=1 -coverprofile=coverage.out ./...
+      - name: Upload coverage artifact
+        if: matrix.go == '1.26'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.go }}
+          path: coverage.out

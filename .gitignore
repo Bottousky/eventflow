@@ -1,0 +1,32 @@
+# Build outputs
+/eventflow
+/eventflow-*
+/eventflow.db
+/eventflow.db-journal
+/eventflow.db-wal
+/eventflow.db-shm
+*.exe
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Local databases and runtime data
+*.db
+*.db-*
+.env
+.env.local
+.env.*.local
+.gotmp/
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Vendor (we use Go modules)
+vendor/
+
+# Build caches (already outside the repo, but be explicit)
+.cache/

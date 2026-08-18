@@ -1,0 +1,36 @@
+# EventFlow runs as two cooperating processes that share a SQLite file.
+# docker-compose.yml starts both on a shared named volume so the API can
+# append events and the worker can read them.
+services:
+  api:
+    build: .
+    image: eventflow:dev
+    command: ["api", "-addr", ":8080", "-db", "/data/eventflow.db"]
+    environment:
+      HTTP_ADDR: ":8080"
+      DB_PATH: /data/eventflow.db
+      LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+    volumes:
+      - eventflow-data:/data
+    restart: unless-stopped
+
+  worker:
+    image: eventflow:dev
+    command: ["worker", "-db", "/data/eventflow.db"]
+    environment:
+      DB_PATH: /data/eventflow.db
+      MAX_ATTEMPTS: "3"
+      WORKER_CONCURRENCY: "4"
+      POLL_INTERVAL: "500ms"
+      BASE_BACKOFF: "100ms"
+      LOG_LEVEL: info
+    depends_on:
+      - api
+    volumes:
+      - eventflow-data:/data
+    restart: unless-stopped
+
+volumes:
+  eventflow-data:
