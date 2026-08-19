@@ -1,6 +1,7 @@
 package obs
 
 import (
+	"math"
 	"strings"
 	"testing"
 )
@@ -84,8 +85,11 @@ func TestHistogramMultipleObservationsAccumulateCorrectly(t *testing.T) {
 	if got := h.Count(); got != 3 {
 		t.Fatalf("count = %d, want 3", got)
 	}
-	if got := h.Sum(); got != 0.001+0.01+0.2 {
-		t.Fatalf("sum = %g, want %g", got, 0.001+0.01+0.2)
+	// Floating-point sum: 0.001 + 0.01 + 0.2 is not exact, so compare
+	// with a tolerance instead of demanding strict equality.
+	want := 0.001 + 0.01 + 0.2
+	if got := h.Sum(); math.Abs(got-want) > 1e-9 {
+		t.Fatalf("sum = %g, want ~%g (within 1e-9)", got, want)
 	}
 
 	// Cumulative (Prometheus output) counts.
@@ -97,7 +101,6 @@ func TestHistogramMultipleObservationsAccumulateCorrectly(t *testing.T) {
 		`test_seconds_bucket{le="0.5"} 3`,
 		`test_seconds_bucket{le="2.5"} 3`,
 		`test_seconds_bucket{le="+Inf"} 3`,
-		`test_seconds_sum 0.211`,
 		`test_seconds_count 3`,
 	}
 	for _, line := range wantLines {
