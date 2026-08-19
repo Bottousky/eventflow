@@ -18,6 +18,10 @@ import (
 type Config struct {
 	// HTTP_ADDR overrides the API listen address (default ":8080").
 	HTTPAddr string
+	// METRICS_ADDR is the listen address for the worker's metrics HTTP
+	// server (default ":9090"). Set to "" to disable the metrics server
+	// in the worker.
+	MetricsAddr string
 	// DB_PATH is the SQLite file the API and worker share (default "eventflow.db").
 	DBPath string
 	// MAX_ATTEMPTS caps the number of send attempts before dead-lettering (default 3).
@@ -38,12 +42,13 @@ type Config struct {
 func Default() Config {
 	return Config{
 		HTTPAddr:          ":8080",
-		DBPath:            "eventflow.db",
-		MaxAttempts:       3,
-		WorkerConcurrency: 4,
-		PollInterval:      500 * time.Millisecond,
-		BaseBackoff:       100 * time.Millisecond,
-		LogLevel:          slog.LevelInfo,
+		MetricsAddr:        ":9090",
+		DBPath:             "eventflow.db",
+		MaxAttempts:        3,
+		WorkerConcurrency:  4,
+		PollInterval:       500 * time.Millisecond,
+		BaseBackoff:        100 * time.Millisecond,
+		LogLevel:           slog.LevelInfo,
 	}
 }
 
@@ -53,6 +58,9 @@ func FromEnv() (Config, error) {
 	c := Default()
 	var err error
 	if c.HTTPAddr, err = getString("HTTP_ADDR", c.HTTPAddr); err != nil {
+		return Config{}, err
+	}
+	if c.MetricsAddr, err = getString("METRICS_ADDR", c.MetricsAddr); err != nil {
 		return Config{}, err
 	}
 	if c.DBPath, err = getString("DB_PATH", c.DBPath); err != nil {
