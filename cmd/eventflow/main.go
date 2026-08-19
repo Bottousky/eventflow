@@ -4,15 +4,19 @@
 // Usage:
 //
 //	eventflow api    [-addr :8080] [-db eventflow.db]
-//	eventflow worker [-db eventflow.db] [-fail email=2] [-once]
+//	eventflow worker [-db eventflow.db] [-fail email=2] [-once] [-metrics :9090]
 //	eventflow demo   [-api http://localhost:8080]
 //
 // All flags are optional: sensible defaults are read from environment
-// variables (HTTP_ADDR, DB_PATH, MAX_ATTEMPTS, WORKER_CONCURRENCY,
-// POLL_INTERVAL, BASE_BACKOFF, LOG_LEVEL) when the flag is omitted.
+// variables (HTTP_ADDR, METRICS_ADDR, DB_PATH, MAX_ATTEMPTS,
+// WORKER_CONCURRENCY, POLL_INTERVAL, BASE_BACKOFF, LOG_LEVEL) when the
+// flag is omitted.
 //
 // The api and worker are separate processes sharing the SQLite stream,
 // the same way production services would share a broker and a database.
+// Each process exposes its own /metrics endpoint: the API serves the
+// events_received counter, the worker serves the orchestrator counters
+// and the processing-duration histogram. Prometheus scrapes both.
 package main
 
 import (
@@ -80,6 +84,7 @@ commands:
 
 environment variables (override defaults):
   HTTP_ADDR            listen address for the API (default :8080)
+  METRICS_ADDR         listen address for the worker's /metrics (default :9090; "" disables)
   DB_PATH              SQLite database path (default eventflow.db)
   MAX_ATTEMPTS         max send attempts before dead-lettering (default 3)
   WORKER_CONCURRENCY   max in-flight ordering-key partitions (default 4)
@@ -143,6 +148,7 @@ func runWorker(args []string, cfg config.Config, logger *slog.Logger) error {
 	dbPath := fs.String("db", cfg.DBPath, "SQLite database path (overrides DB_PATH)")
 	once := fs.Bool("once", false, "process pending events once and exit")
 	fail := fs.String("fail", "", "deterministic failure injection, e.g. email=2 or push=always")
+	metricsAddr := fs.String("metrics", cfg.MetricsAddr, "metrics HTTP listen address (overrides METRICS_ADDR; empty disables)")
 	_ = fs.Parse(args)
 
 	st, dbs, closeDB, err := openStack(*dbPath)
@@ -173,7 +179,8 @@ func runWorker(args []string, cfg config.Config, logger *slog.Logger) error {
 			}
 		},
 	}
-	o := orchestrator.New(st, dbs, kvs.New(24*time.Hour, time.Now), registry, obs.New(), logger, orchCfg)
+	metrics := obs.New()
+	o := orchestrator.New(st, dbs, kvs.New(24*time.Hour, time.Now), registry, metrics, logger, orchCfg)
 
 	if *once {
 		n, err := o.ProcessOnce(context.Background())
@@ -183,6 +190,31 @@ func runWorker(args []string, cfg config.Config, logger *slog.Logger) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Start the metrics HTTP server before Run so Prometheus can scrape
+	// the worker counters from the very first batch. Set METRICS_ADDR=""
+	// (or -metrics "") to disable it.
+	var metricsSrv *http.Server
+	if *metricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", metrics.Handler())
+		metricsSrv = &http.Server{Addr: *metricsAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = metricsSrv.Shutdown(shutdownCtx)
+		}()
+		go func() {
+			logger.Info("worker metrics listening", "addr", *metricsAddr)
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Error("worker metrics server stopped", "error", err)
+			}
+		}()
+	} else {
+		logger.Info("worker metrics disabled (METRICS_ADDR is empty)")
+	}
+
 	return o.Run(ctx)
 }
 
