@@ -5,6 +5,63 @@ handle, how each one is detected, and what the user-visible behaviour
 is. The intent is to make the failure semantics explicit so they can
 be reviewed, tested and reasoned about.
 
+## Delivery semantics: at-least-once, not exactly-once
+
+EventFlow provides **at-least-once** delivery with **durable/local
+deduplication** and **provider-supplied idempotency keys**. It does
+not implement exactly-once — that property is fundamentally
+unachievable without either two-phase commit between the orchestrator
+and the provider, or provider-side idempotency, and we make no
+attempt to fake it.
+
+The two layers that make the system safe for at-least-once:
+
+1. **Notification store** (persistent). The orchestrator calls
+   `EnsureNotification` which inserts or fetches the row keyed by
+   `(event_id, channel)`. The row carries a status of
+   `pending` / `delivered` / `dead`. A `delivered` or `dead` row is
+   never re-sent, regardless of how many times the worker restarts —
+   **provided `MarkDelivered` or `MarkDead` actually committed**.
+2. **In-memory KVS** (in-flight). After the store check, the
+   orchestrator calls `kvs.SetNX("event:channel")`. This mirrors Redis
+   `SET NX PX` and is what prevents two worker replicas from
+   double-sending the same notification while the persistent row is
+   still `pending`.
+
+The KVS is the right tool for "two replicas running at the same time";
+the store is the right tool for "this delivery was already finalized
+yesterday". Together they cover both the hot and the cold case —
+**except** for the crash window described next.
+
+## The crash window: a real, narrow at-least-once gap
+
+There is a window in the current implementation between
+`Sender.Send` returning success and `MarkDelivered` committing. A
+crash in that window — the process dies after the provider accepted
+the message but before the row was updated — leaves the notification
+row at `pending`. The next worker that reads the record sees
+`pending`, calls `Sender.Send` again, and the provider receives the
+message a second time.
+
+The system does **not** prevent this. The honest guarantee is:
+
+- **Within the orchestrator's process**, the row's status moves to
+  `delivered` exactly once (because `MarkDelivered` is a single SQL
+  UPDATE on a UNIQUE-indexed row).
+- **Across an orchestrator crash**, the row may still be `pending`
+  on restart. The provider may receive the message twice.
+
+The recommended mitigation in production is to derive a stable
+provider-side idempotency key from the notification row's primary
+key (`notifications.id`, formatted as a string), and pass it to the
+provider's API as the idempotency key. Providers that support this
+(every major email/push/SMS gateway does) collapse the duplicate on
+replay. If the provider does **not** support idempotency keys, the
+caller must accept that duplicate delivery is possible.
+
+This is documented honestly here rather than hidden behind the phrase
+"exactly once" so a reviewer can reason about it.
+
 ## Sender failures
 
 ### Transient failure (retry)
@@ -20,7 +77,9 @@ A `Sender.Send` call returns a non-permanent error. The orchestrator:
 If any attempt succeeds, the notification is marked `delivered` and
 `notifications_delivered_total` is incremented. If the budget is
 exhausted, the notification is marked `dead` and a row is inserted
-into `dead_letters`. `events_dead_lettered_total` is incremented.
+into `dead_letters`. **Both writes happen inside the same SQL
+transaction**, with rollback on either failure. `events_dead_lettered_total`
+is incremented.
 
 ### Permanent failure (skip retry)
 
@@ -38,9 +97,11 @@ and delays the operator's signal that the failure is permanent.
 ### Context cancellation
 
 If `ctx.Done()` fires during a `Sender.Send` call, the sender returns
-the context error and the orchestrator stops processing the current
-batch. The notification row stays at its current status (likely
-`pending`), and on the next `ProcessOnce` the orchestrator retries it.
+the context error and the orchestrator reports `ChannelPending`. The
+notification row stays at `pending` and the KVS lock is released so
+the next worker can retry without waiting for the TTL (24h) to
+expire. The cursor does not advance past this record; the next
+`ProcessOnce` re-reads it.
 
 ## Duplicates
 
@@ -51,13 +112,22 @@ append returns `ErrDuplicateID`, and the API responds with 500. The
 event-id uniqueness is the at-most-once append contract; producers are
 expected to retry on a 5xx with the same event id.
 
-### Same event processed twice (worker restart)
+### Same event processed twice (worker restart, terminal state)
 
 The orchestrator reads from the stream using a cursor. If the worker
 crashes between processing a record and advancing the cursor, the
 record is re-read on restart. The notification row is already
 `delivered` or `dead`, so `EnsureNotification` returns the existing
-row and the orchestrator skips it. No re-send happens.
+row and the orchestrator skips the send. **This is the replay-safety
+property the persistent store gives us.**
+
+### Same event processed twice (worker restart, crash window)
+
+If the worker crashed in the window between `Sender.Send` returning
+success and `MarkDelivered` committing, the row is still `pending` on
+restart. The next `ProcessOnce` calls `Sender.Send` again. The
+provider sees a duplicate. Provider-side idempotency keys are the
+mitigation; see "The crash window" above.
 
 ### Same event processed by two workers at the same time
 
@@ -66,12 +136,41 @@ find the notification `pending` and both call `Sender.Send`. The
 in-memory KVS prevents this: each worker calls `kvs.SetNX(key)` on
 the `(event_id, channel)` key. Only the first one wins; the second
 sees the key already set, increments `duplicates_suppressed_total`,
-and skips the send.
+reports `ChannelDuplicateSuppressed`, and the cursor stops before
+the record so the next `ProcessOnce` re-reads it once the winning
+worker has committed.
 
 In a real production deployment the KVS would be Redis so all worker
 replicas share it; in the demo, each worker has its own in-memory
 KVS, which is enough to demonstrate the pattern within a single
 process.
+
+## Cursor and terminal states
+
+The orchestrator's cursor is gated on **terminal durable state**:
+
+- A record advances the cursor only when every channel it carries
+  reached a terminal state (`delivered` or `dead`).
+- A record that ends in a non-terminal state (pending, duplicate-
+  suppressed) blocks the cursor for itself and for every record
+  behind it in the same `ordering_key` partition.
+- Within an `ordering_key` partition, when one record ends in a
+  non-terminal state the goroutine stops processing later records
+  in the same group. They are not lost — they are re-read on the
+  next `ProcessOnce` once the pending record resolves.
+- Records behind a pending record can be re-attempted on a future
+  poll. Their terminal durable state makes the replay harmless for
+  finalized ones, and the at-least-once + provider-idempotency
+  story covers the crash-window case.
+
+## Atomicity: status update + dead-letter insert
+
+`MarkDead` runs `UPDATE notifications SET status='dead'` and
+`INSERT INTO dead_letters ...` inside a single SQL transaction.
+Either both commits, or both roll back. A `dead` notification with
+no DLQ entry is impossible. The opposite was true in the previous
+implementation and is covered by
+`TestDeadLetterRollsBackOnInsertFailure`.
 
 ## Storage failures
 
@@ -125,10 +224,28 @@ start.
 ### Crash mid-batch
 
 The orchestrator's cursor advances in seq order up to the highest
-contiguous processed record. A crash leaves the cursor at the last
-fully-processed record; on restart, the orchestrator re-reads from
-there. The notification store is the source of truth for "already
-delivered", so re-processing is safe and idempotent.
+contiguous `RecordTerminal` record. A crash leaves the cursor at the
+last fully-terminal record; on restart, the orchestrator re-reads
+from there. Notifications whose status is `delivered` or `dead` are
+skipped on replay; notifications still at `pending` are retried.
+
+## Observability
+
+### Metrics split by process
+
+The API process and the worker process each own their own `*Metrics`
+instance. The API exposes `/metrics` (default `:8080`) with
+`events_received`. The worker exposes its own `/metrics` (default
+`:9090`, configurable via `METRICS_ADDR`) with the orchestrator
+counters (`events_processed`, `notifications_delivered`,
+`delivery_retries`, `duplicates_suppressed`, `events_dead_lettered`,
+`processing_errors`) and the processing-duration histogram.
+
+In the previous implementation, the worker counters were
+incremented inside the worker but never exposed anywhere: the API's
+`/metrics` only knew `events_received`. Prometheus scrape config
+should target both endpoints; both use the standard
+`text/plain; version=0.0.4` exposition format.
 
 ## Out of scope
 
