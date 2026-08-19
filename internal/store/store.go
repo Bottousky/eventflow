@@ -95,8 +95,8 @@ func (s *Store) EnsureNotification(ctx context.Context, eventID string, ch event
 	now := time.Now().UTC().Format(timeFormat)
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO notifications (event_id, channel, status, updated_at)
-		 VALUES (?, ?, ?, ?)
-		 ON CONFLICT (event_id, channel) DO NOTHING`,
+	 VALUES (?, ?, ?, ?)
+	 ON CONFLICT (event_id, channel) DO NOTHING`,
 		eventID, string(ch), string(events.StatusPending), now)
 	if err != nil {
 		return events.Notification{}, fmt.Errorf("ensure notification: %w", err)
@@ -122,7 +122,7 @@ func (s *Store) getNotificationByEventChannel(ctx context.Context, where string,
 	var status, channel, updated string
 	err := s.db.QueryRowContext(ctx,
 		`SELECT id, event_id, channel, status, attempts, last_error, updated_at
-		 FROM notifications `+where, args...).
+	 FROM notifications `+where, args...).
 		Scan(&n.ID, &n.EventID, &channel, &status, &n.Attempts, &n.LastError, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return events.Notification{}, ErrNotFound
@@ -141,7 +141,7 @@ func (s *Store) getNotificationByEventChannel(ctx context.Context, where string,
 func (s *Store) NotificationsForEvent(ctx context.Context, eventID string) ([]events.Notification, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, event_id, channel, status, attempts, last_error, updated_at
-		 FROM notifications WHERE event_id = ? ORDER BY id`, eventID)
+	 FROM notifications WHERE event_id = ? ORDER BY id`, eventID)
 	if err != nil {
 		return nil, fmt.Errorf("list notifications: %w", err)
 	}
@@ -189,16 +189,39 @@ func (s *Store) MarkDelivered(ctx context.Context, notificationID int64) error {
 
 // MarkDead sets the notification status to dead and writes a dead-letter
 // entry for later inspection and reprocessing.
+//
+// Both writes happen inside the same SQL transaction so that the system
+// never sees a `dead` notification without a matching dead_letters row.
+// If either step fails (disk full, schema drift, lock timeout), the
+// transaction is rolled back and the notification stays in `pending`
+// state, which means a future ProcessOnce will retry the delivery
+// instead of silently losing the operator signal.
 func (s *Store) MarkDead(ctx context.Context, n events.Notification, cause error) error {
-	if err := s.setStatus(ctx, n.ID, events.StatusDead); err != nil {
-		return err
-	}
 	now := time.Now().UTC().Format(timeFormat)
-	if _, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin dead-letter tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE notifications SET status = ?, updated_at = ? WHERE id = ?`,
+		string(events.StatusDead), now, n.ID); err != nil {
+		return fmt.Errorf("set status dead: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO dead_letters (event_id, channel, error, at) VALUES (?, ?, ?, ?)`,
 		n.EventID, string(n.Channel), cause.Error(), now); err != nil {
 		return fmt.Errorf("insert dead letter: %w", err)
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit dead-letter tx: %w", err)
+	}
+	committed = true
 	return nil
 }
 
@@ -259,7 +282,7 @@ func (s *Store) Cursor(ctx context.Context) (int64, error) {
 func (s *Store) SetCursor(ctx context.Context, seq int64) error {
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT INTO cursor (id, last_seq) VALUES (1, ?)
-		 ON CONFLICT (id) DO UPDATE SET last_seq = excluded.last_seq`, seq); err != nil {
+	 ON CONFLICT (id) DO UPDATE SET last_seq = excluded.last_seq`, seq); err != nil {
 		return fmt.Errorf("write cursor: %w", err)
 	}
 	return nil
