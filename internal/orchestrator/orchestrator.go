@@ -18,7 +18,6 @@ package orchestrator
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -430,8 +429,3 @@ func (o *Orchestrator) backoff(attempt int) time.Duration {
 	}
 	return d
 }
-
-// Unused import guard: fmt is referenced only by the doc string for the
-// sender-missing error path. Keep the import explicit so future edits
-// that re-introduce fmt.Errorf do not break the build.
-var _ = fmt.Sprintf
