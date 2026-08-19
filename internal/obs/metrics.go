@@ -15,6 +15,12 @@ import (
 
 // Metrics is a goroutine-safe set of named counters and a duration
 // histogram. The Render output is stable: counters are sorted by name.
+//
+// Process boundaries: the API and the worker each own their own *Metrics
+// instance. The API exposes /metrics with events_received; the worker
+// exposes its own /metrics endpoint (configurable listen address) with
+// the worker-side counters and histogram. Prometheus scrape config
+// should target both endpoints independently.
 type Metrics struct {
 	mu        sync.Mutex
 	counters  map[string]uint64
@@ -130,13 +136,18 @@ func (m *Metrics) Render() string {
 	return b.String()
 }
 
-// Histogram is a tiny Prometheus-style histogram. Bucket boundaries are
-// interpreted as upper-inclusive seconds.
+// Histogram is a tiny Prometheus-style histogram.
+//
+// bucketHits[i] holds the count of observations that fell into bucket i
+// (the smallest bucket whose upper bound is >= the observation). Each
+// observation increments exactly one bucket. Render() then emits
+// Prometheus-style cumulative bucket counts, plus _sum and _count, so
+// each observation is counted once in the output.
 type Histogram struct {
 	buckets    []float64
 	sum        float64
 	count      uint64
-	bucketHits []uint64 // bucketHits[i] = count of observations <= buckets[i]
+	bucketHits []uint64 // bucketHits[i] = observations that fell into bucket i (not cumulative)
 }
 
 // NewHistogram builds a Histogram with the given bucket upper bounds
@@ -151,12 +162,20 @@ func NewHistogram(buckets []float64) *Histogram {
 }
 
 // Observe records v (in seconds) in the histogram.
+//
+// Each observation increments exactly one bucket: the smallest bucket
+// whose upper bound is >= v. If v is larger than every finite bucket,
+// the observation is counted only in the +Inf bucket emitted at render
+// time (not in any of the bucketHits entries), so Prometheus sees a
+// consistent total. Callers that need to know how many observations
+// fell into the +Inf bucket should read Count().
 func (h *Histogram) Observe(v float64) {
 	h.sum += v
 	h.count++
 	for i, b := range h.buckets {
 		if v <= b {
 			h.bucketHits[i]++
+			return
 		}
 	}
 }
@@ -167,8 +186,19 @@ func (h *Histogram) Count() uint64 { return h.count }
 // Sum returns the sum of all observations in seconds.
 func (h *Histogram) Sum() float64 { return h.sum }
 
+// BucketCounts returns the per-bucket counts (non-cumulative) plus the
+// bucket upper bounds. It is primarily useful for tests; the production
+// /metrics endpoint renders through Render() instead.
+func (h *Histogram) BucketCounts() (bounds []float64, counts []uint64) {
+	bounds = append([]float64(nil), h.buckets...)
+	counts = make([]uint64, len(h.bucketHits))
+	copy(counts, h.bucketHits)
+	return bounds, counts
+}
+
 // Render formats the histogram with the given metric name in Prometheus
-// text exposition format.
+// text exposition format. Bucket lines are cumulative (each bucket's
+// count includes all observations that fell into smaller buckets).
 func (h *Histogram) Render(name string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# HELP %s Distribution of per-record processing time in seconds.\n", name)
