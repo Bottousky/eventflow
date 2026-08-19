@@ -1,10 +1,11 @@
 # EventFlow — Notification Orchestrator
 
 > A small but serious reference implementation of an event-driven notification
-> backend in Go. Demonstrates ordered event processing, idempotency, retries
-> with exponential backoff, a dead-letter queue, persistence, observability,
-> bounded concurrency, graceful shutdown, and a serious test suite — all in
-> a repository that compiles, tests and runs without external services.
+> backend in Go. Demonstrates ordered event processing, durable idempotency
+> with provider-supplied keys, retries with exponential backoff, an atomic
+> dead-letter queue, persistence, observability, bounded concurrency, graceful
+> shutdown, and a serious test suite — all in a repository that compiles,
+> tests and runs without external services.
 
 ## What it demonstrates
 
@@ -16,26 +17,34 @@
   from the last processed position.
 - **Notification orchestrator** that fans events out to channel senders
   (email, push, in-app) with:
+  - **at-least-once** delivery with two layers of deduplication:
+    the persistent `notifications` table (source of truth for
+    terminal state) plus the in-memory KVS that mirrors Redis
+    `SET NX PX` for in-flight cross-replica dedup,
+  - reusable provider idempotency keys built from the notification's
+    stable primary key — providers that support idempotency can
+    collapse the duplicate that the crash window can otherwise
+    produce (see [FAILURE_MODEL.md](docs/FAILURE_MODEL.md)),
   - bounded per-ordering-key concurrency (different keys in parallel,
     same key sequential),
   - exponential backoff with a 2 s cap,
   - permanent vs. transient error distinction,
-  - in-memory idempotency cache (mirrors Redis `SET NX`) plus a
-    crash-safe `notifications` table so a restarted worker never sends
-    twice,
-  - a dead-letter queue for inspection after the retry budget is spent.
+  - an atomic dead-letter queue (`status=dead` + `dead_letters` row in
+    the same SQL transaction, with full rollback on failure).
 - **Persistence** in SQLite via the pure-Go
   [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite) driver —
   no CGO, no external services. The schema is created on first use.
-- **Observability** with structured logs (`log/slog`) and a Prometheus
-  text format `/metrics` endpoint (counters for received/processed/
-  delivered/retries/duplicates/dead-lettered/errors and a per-record
-  processing-duration histogram).
+- **Observability** with structured logs (`log/slog`) and Prometheus
+  text format `/metrics` endpoints. The **API process** exposes
+  `events_received`; the **worker process** exposes the orchestrator
+  counters and the processing-duration histogram on its own
+  configurable listen address (default `:9090`, set `METRICS_ADDR=""`
+  to disable). Prometheus scrapes both.
 - **Request IDs** via `X-Request-ID` (echoed if provided, generated
   otherwise) and propagated through the request context.
-- **Configuration** via environment variables (`HTTP_ADDR`, `DB_PATH`,
-  `MAX_ATTEMPTS`, `WORKER_CONCURRENCY`, `POLL_INTERVAL`, `BASE_BACKOFF`,
-  `LOG_LEVEL`) and command-line flags.
+- **Configuration** via environment variables (`HTTP_ADDR`,
+  `METRICS_ADDR`, `DB_PATH`, `MAX_ATTEMPTS`, `WORKER_CONCURRENCY`,
+  `POLL_INTERVAL`, `BASE_BACKOFF`, `LOG_LEVEL`) and command-line flags.
 - **Graceful shutdown** of both the API (HTTP `Server.Shutdown`) and the
   worker (context-aware `Run` loop).
 - **Tests** — unit, integration and end-to-end — including a race-aware
@@ -79,6 +88,7 @@ curl http://localhost:8080/events/evt_...
 # Health and metrics
 curl http://localhost:8080/health
 curl http://localhost:8080/metrics
+curl http://localhost:9090/metrics   # worker counters + histogram
 ```
 
 `go run ./cmd/eventflow worker -fail email=2` makes the email sender fail
@@ -95,13 +105,14 @@ queue.
 flowchart LR
     C[Client] -->|POST /events| A[REST API]
     A -->|append| S[(Event Stream<br/>SQLite)]
-    A -->|metrics| M[/metrics]
+    A -->|events_received| MA[/metrics API :8080]
     O[Notification<br/>Orchestrator] -->|ReadAfter seq| S
-    O -->|EnsureNotification / MarkDelivered / DLQ| N[(notifications,<br/>delivery_attempts,<br/>dead_letters<br/>SQLite)]
+    O -->|EnsureNotification / MarkDelivered / atomic DLQ| N[(notifications,<br/>delivery_attempts,<br/>dead_letters<br/>SQLite)]
     O -->|SetNX| K[(Idempotency KVS)]
     O -->|Send| E[Email]
     O -->|Send| P[Push]
     O -->|Send| I[In-App]
+    O -->|processed / delivered / retries / dead_lettered| MW[/metrics worker :9090]
     C -->|GET /events/{id}<br/>GET /notifications/{id}| A
 ```
 
@@ -144,15 +155,26 @@ template) and should never be retried.
 `go run ./cmd/eventflow worker -fail push=always` makes the push sender
 fail forever. After the configured attempt budget is spent, the
 notification is marked `status=dead` and a row is written to
-`dead_letters`. The orchestrator's `delivery_attempts` table records
-every failed attempt for inspection.
+`dead_letters` — both writes are inside the same SQL transaction so a
+mid-write failure rolls back the status change too. The orchestrator's
+`delivery_attempts` table records every failed attempt for inspection.
 
-### Replay after restart never re-delivers
+### Replay after restart is at-least-once
 
-The orchestrator's `notifications` table is the source of truth: if a
-row is already `delivered` or `dead`, `ProcessOnce` skips it. The
-in-memory KVS also deduplicates in-flight delivery across worker
-instances, mirroring Redis `SET NX PX` semantics.
+The orchestrator reads from the stream using a cursor. If the worker
+crashes between processing a record and advancing the cursor, the
+record is re-read on restart. The notification row is the source of
+truth: if it is already `delivered` or `dead`, `ProcessOnce` skips the
+`Sender.Send` call.
+
+The window between `Sender.Send` returning success and `MarkDelivered`
+committing is **still at-least-once**: a crash in that window makes the
+next attempt re-send. The recommended mitigation is to pass the
+notification row's stable primary key as a provider-side idempotency
+key; providers that support it collapse the duplicate on replay. If
+the provider does not support idempotency keys, duplication is
+possible — see [FAILURE_MODEL.md](docs/FAILURE_MODEL.md) for the full
+discussion.
 
 ## Concurrency model
 
@@ -160,11 +182,17 @@ The orchestrator is the only place with goroutines. `ProcessOnce` reads
 a batch from the stream, groups the records by `ordering_key`, and
 spawns one goroutine per group, capped by `WORKER_CONCURRENCY` (default
 4). Each goroutine processes its group sequentially — that is what
-preserves per-key order — while different groups run in parallel. The
-cursor advances in seq order up to the highest seq whose record was
-attempted.
+preserves per-key order — while different groups run in parallel.
 
-The orchestrator also reacts to context cancellation: `Run` returns
+A record only advances the cursor when every channel it carries
+reached a terminal durable state (`delivered` or `dead`). A record
+that ends in a non-terminal state stops the cursor for itself and for
+every record behind it in the same ordering_key partition; the next
+`ProcessOnce` re-reads the pending record together with everything
+that followed it. Inside a group, a non-terminal record also stops the
+goroutine so per-key order survives an infrastructure failure.
+
+The orchestrator reacts to context cancellation: `Run` returns
 promptly when the context is canceled, and `ProcessOnce` aborts
 in-flight processing.
 
@@ -178,22 +206,19 @@ is configurable with `LOG_LEVEL=debug|info|warn|error`.
 
 ### Metrics
 
-`GET /metrics` returns Prometheus text exposition format. The current
-metric set:
+EventFlow exposes **two** `/metrics` endpoints, one per process. The
+shape matches Prometheus text exposition format so a Prometheus
+server, Datadog Agent, Grafana Alloy, or any other OpenMetrics-compatible
+agent can scrape both.
 
-```
-eventflow_events_received_total
-eventflow_events_processed_total
-eventflow_notifications_delivered_total
-eventflow_delivery_retries_total
-eventflow_duplicates_suppressed_total
-eventflow_events_dead_lettered_total
-eventflow_processing_errors_total
-eventflow_processing_duration_seconds (histogram, 5 buckets)
-```
+| Process | Endpoint (default) | Counters / histogram                                  |
+|---------|--------------------|------------------------------------------------------|
+| API     | `:8080/metrics`    | `eventflow_events_received_total`                     |
+| Worker  | `:9090/metrics`    | `eventflow_events_processed_total`, `…_delivered_total`, `…_retries_total`, `…_dead_lettered_total`, `eventflow_processing_duration_seconds` (histogram) |
 
-The output is intended to be scraped by Prometheus, Datadog, Grafana
-Cloud or any other agent that understands the text format.
+A scrape config that targets both endpoints lets a real deployment see
+the same metric set as the demo. Disable the worker endpoint by setting
+`METRICS_ADDR=""`.
 
 ## Testing
 
@@ -216,11 +241,20 @@ The test suite covers:
 - API validation, request IDs, `/metrics` content
 - Stream append, ordering, cursor round-trips, duplicate-id rejection
 - KVS `SetNX` dedup, TTL expiration
-- Store idempotency, attempts, dead-letter flow, notifications-by-event
+- Store idempotency, attempts, dead-letter flow, notifications-by-event,
+  **DLQ atomicity (status update + dead_letters insert rolled back
+  together if either step fails)**
 - Sender: fail-then-succeed, fail-always, permanent error, canceled ctx
 - Orchestrator: append-order processing, retries, DLQ, replay, in-flight
-  dedup, multi-channel fan-out, **bounded concurrency across keys**,
-  **sequential processing within a key**, graceful shutdown
+  dedup, multi-channel fan-out, bounded concurrency across keys,
+  sequential processing within a key, **cursor does not advance past
+  a non-terminal record**, **ordering_key partition stops after a
+  non-terminal failure**, **KVS lock released on non-terminal results
+  and kept on terminal ones**, graceful shutdown
+- Cross-process metrics split (API sees only `events_received`, worker
+  sees the orchestrator counters and histogram)
+- Histogram: bucket counts, `_sum`, `_count` follow the Prometheus
+  convention (one observation increments exactly one bucket)
 - End-to-end: two separate stacks sharing a SQLite file, the API
   accepts an event, the worker processes it, the API reports the
   final delivery state.
@@ -239,7 +273,7 @@ eventflow/
 │   ├── events/            # domain types (Event, Channel, Notification, PermanentError)
 │   ├── kvs/               # in-memory idempotency cache
 │   ├── obs/               # metrics (Prometheus text format)
-│   ├── orchestrator/      # worker loop, retry, DLQ, bounded concurrency
+│   ├── orchestrator/      # worker loop, retry, atomic DLQ, bounded concurrency
 │   ├── senders/           # simulated channels, failure injection
 │   ├── store/             # SQLite persistence (notifications, attempts, DLQ, cursor)
 │   └── stream/            # append-only event stream
@@ -259,7 +293,10 @@ eventflow/
 
 - No real email/push/in-app providers. The senders are simulated. The
   `Sender` interface is the integration point — replace it with a real
-  provider by writing a new `Send` implementation.
+  provider by writing a new `Send` implementation. When you do, pass
+  `n.ID` (or a hash of `event_id+channel`) as the provider-side
+  idempotency key so the at-least-once crash window cannot produce a
+  duplicate downstream.
 - No broker like Kafka or SQS. The event stream is a SQLite table;
   ordered append and per-cursor reads are enough to demonstrate the
   concept. Mapping this to a real broker means swapping the
@@ -287,8 +324,8 @@ above.
 > data or confidential information.
 
 The patterns EventFlow demonstrates — ordered event processing,
-idempotency, retries, dead-lettering, observability, bounded
-concurrency, context propagation, strict typing — are general
+durable idempotency, retries, atomic dead-lettering, observability,
+bounded concurrency, context propagation, strict typing — are general
 backend-engineering concepts that show up across many production
 systems. They are not tied to any specific employer, internal
 architecture, vendor or proprietary product.
